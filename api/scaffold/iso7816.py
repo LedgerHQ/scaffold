@@ -473,7 +473,8 @@ class Smartcard:
             self.transmit_block(
                 0, (self.t1_ns_tx << 6) + (has_more << 5), chunk,
                 enable_trigger)
-            self.t1_ns_tx = (self.t1_ns_tx + 1) % 2  # Increment sequence number
+            # Increment sequence number
+            self.t1_ns_tx = (self.t1_ns_tx + 1) % 2
             if has_more:
                 # We expect a R-block before sending the next info block
                 block = self.receive_block()
