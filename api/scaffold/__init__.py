@@ -1912,6 +1912,11 @@ class BusOperationStatus(Enum):
 
 
 class BusOperation:
+    """
+    References a bus read or write operation requested to the Scaffold board.
+    Used to fetch the operation result as late as possible to reduce
+    communication latency and increase performances.
+    """
     def __init__(self, bus: 'ScaffoldBus', kind: BusOperationKind, size: int,
             fifo_size: int):
         self.__bus = bus
@@ -1972,8 +1977,9 @@ class BusOperation:
     @property
     def result(self) -> Optional[bytes]:
         """
-        :return: Read bytes if the operation is a read, None if the operation
-            is a write.
+        Read bytes if the operation is a read, None if the operation is a write.
+        If the operation is still pending in the hardware, it will wait until
+        the result is available (or the operation times out).
 
         :raises: TimeoutError if operation timed out.
         """
@@ -2096,14 +2102,19 @@ class ScaffoldBus:
             assert len(self.__operations) > 0
             self.fetch_oldest_operation_result()
 
-    def operation_write(
-            self, addr: int, data: bytes, poll: Optional[int] = None,
+    def operation(
+            self, kind: BusOperationKind, addr: int,
+            data: Union[bytes, int], poll: Optional[int] = None,
             poll_mask: int = 0xff, poll_value: int = 0x00) -> BusOperation:
         """
-        Write data to a register.
+        Launch a read or write operation.
 
+        :param kind: Operation kind (read or write).
         :param addr: Register address.
-        :param data: Data to be written.
+        :param size: Number of bytes to be read, when operation is
+            `BusOperationKind.READ`, otherwise `None`.
+        :param data: Data to be written, when operation is
+            `BusOperationKind.WRITE`, otherwise `None`.
         :param poll: Register instance or address, if polling is required.
         :param poll_mask: Register polling mask.
         :param poll_value: Register polling value.
@@ -2111,39 +2122,21 @@ class ScaffoldBus:
         """
         if self.ser is None:
             raise RuntimeError('Not connected to board')
-
-        assert len(data) <= self.MAX_CHUNK
-        datagram = self.prepare_datagram(
-            1, addr, len(data), poll, poll_mask, poll_value)
-        datagram += data
-        assert len(datagram) < self.FIFO_MAX_SIZE
+        if kind == BusOperationKind.WRITE:
+            assert type(data) in (bytes, bytearray)
+            assert len(data) <= self.MAX_CHUNK
+            datagram = self.prepare_datagram(
+                1, addr, len(data), poll, poll_mask, poll_value)
+            datagram += data
+            op = BusOperation(self, kind, len(data), len(datagram))
+        else:
+            assert kind == BusOperationKind.READ
+            assert type(data) is int  # data is number of bytes
+            assert data <= self.MAX_CHUNK
+            datagram = self.prepare_datagram(
+                0, addr, data, poll, poll_mask, poll_value)
+            op = BusOperation(self, kind, data, len(datagram))
         self.__require_fifo_space(len(datagram))
-        op = BusOperation(
-            self, BusOperationKind.WRITE, len(data), len(datagram))
-        self.__operations.append(op)
-        self.ser.write(datagram)
-        return op
-
-    def operation_read(
-            self, addr: int, size: int = 1, poll: Optional[int] = None,
-            poll_mask: int = 0xff, poll_value: int = 0x00) -> BusOperation:
-        """
-        Read data from a register.
-
-        :param addr: Register address.
-        :param poll: Register instance or address, if polling is required.
-        :param poll_mask: Register polling mask.
-        :param poll_value: Register polling value.
-        :return: Read pending operation.
-        """
-        if self.ser is None:
-            raise RuntimeError('Not connected to board')
-
-        assert size <= self.MAX_CHUNK
-        datagram = self.prepare_datagram(
-            0, addr, size, poll, poll_mask, poll_value)
-        self.__require_fifo_space(len(datagram))
-        op = BusOperation(self, BusOperationKind.READ, size, len(datagram))
         self.__operations.append(op)
         self.ser.write(datagram)
         return op
@@ -2167,9 +2160,9 @@ class ScaffoldBus:
         remaining = len(data)
         while remaining:
             chunk_size = min(self.MAX_CHUNK, remaining)
-            op = self.operation_write(
-                addr, data[offset:offset + chunk_size], poll, poll_mask,
-                poll_value)
+            op = self.operation(
+                BusOperationKind.WRITE, addr, data[offset:offset + chunk_size],
+                poll, poll_mask, poll_value)
             if self.__lazy_stack == 0:
                 _ = op.result
             remaining -= chunk_size
@@ -2196,8 +2189,9 @@ class ScaffoldBus:
         offset = 0
         while remaining:
             chunk_size = min(self.MAX_CHUNK, remaining)
-            op = self.operation_read(
-                addr, chunk_size, poll, poll_mask, poll_value)
+            op = self.operation(
+                BusOperationKind.READ, addr, chunk_size, poll, poll_mask,
+                poll_value)
             result += op.result
             remaining -= chunk_size
             offset += chunk_size
