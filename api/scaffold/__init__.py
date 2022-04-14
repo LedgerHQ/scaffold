@@ -21,7 +21,7 @@ from enum import Enum
 import serial
 from time import sleep
 import serial.tools.list_ports
-from typing import Optional
+from typing import Optional, List, Union
 
 
 class TimeoutError(Exception):
@@ -1900,12 +1900,105 @@ class ScaffoldBusTimeoutSection:
         self.bus.pop_timeout()
 
 
+class BusOperationKind(Enum):
+    READ = 0
+    WRITE = 1
+
+
+class BusOperationStatus(Enum):
+    PENDING = 0
+    OK = 1
+    TIMEOUT = 2
+
+
+class BusOperation:
+    def __init__(self, bus: 'ScaffoldBus', kind: BusOperationKind, size: int,
+            fifo_size: int):
+        self.__bus = bus
+        self.__kind = kind
+        self.__fifo_size = fifo_size
+        self.__size = size
+        self.__status = BusOperationStatus.PENDING
+        self.__result: Optional[Union[bytes, int]] = None
+
+    def __del__(self):
+        """
+        :raises: TimeoutError if operation timed out.
+        """
+        _ = self.result
+
+    def resolve(self, result: Union[bytes, int]):
+        """
+        Mark the operation as completed and set the result details.
+
+        :param result: Read bytes for a read operation, number of bytes written
+            for a write operation.
+        """
+        assert self.__status == BusOperationStatus.PENDING
+        if self.kind == BusOperationKind.READ:
+            assert type(result) in (bytes, bytearray)
+            size_completed = len(result)
+        else:
+            assert self.kind == BusOperationKind.WRITE
+            assert type(result) is int
+            size_completed = result
+
+        if size_completed == self.__size:
+            self.__status = BusOperationStatus.OK
+        else:
+            self.__status = BusOperationStatus.TIMEOUT
+            assert size_completed < self.__size
+
+        self.__result = result
+
+    def sync(self):
+        """ Wait until this operation has been processed. """
+        while self.__status == BusOperationStatus.PENDING:
+            self.__bus.fetch_oldest_operation_result()
+
+    @property
+    def kind(self) -> BusOperationKind:
+        return self.__kind
+
+    @property
+    def size(self) -> int:
+        return self.__size
+
+    @property
+    def fifo_size(self) -> int:
+        """ Size of the operation in the FIFO """
+        return self.__fifo_size
+
+    @property
+    def result(self) -> Optional[bytes]:
+        """
+        :return: Read bytes if the operation is a read, None if the operation
+            is a write.
+
+        :raises: TimeoutError if operation timed out.
+        """
+        self.sync()
+        status = self.__status
+        assert status != BusOperationStatus.PENDING
+        if status == BusOperationStatus.OK:
+            if self.__kind == BusOperationKind.READ:
+                return self.__result
+            else:
+                return None
+        elif status == BusOperationStatus.TIMEOUT:
+            raise TimeoutError(size=self.__size_completed, expected=__self.size)
+        else:
+            # BusOperationStatus.PENDING cannot happen.
+            # Also raise in case the field is not a BusOperationStatus.
+            raise RuntimeError("Invalid status of droped operation")
+
+
 class ScaffoldBus:
     """
     Low level methods to drive the Scaffold device.
     """
     MAX_CHUNK = 255
-    FIFO_SIZE = 512
+    FIFO_MAX_SIZE = 512
 
     def __init__(self, sys_freq, baudrate):
         """
@@ -1926,6 +2019,7 @@ class ScaffoldBus:
         self.__cache_timeout = None
         # Timeout stack for push_timeout and pop_timeout methods.
         self.__timeout_stack = []
+        self.__operations: List[BusOperation] = []
 
     def connect(self, dev):
         """
@@ -1936,10 +2030,12 @@ class ScaffoldBus:
         self.ser = serial.Serial(dev, self.__baudrate)
 
     def prepare_datagram(
-            self, rw, addr, size, poll, poll_mask, poll_value):
+            self, rw: int, addr: int, size: int, poll: Optional[int],
+            poll_mask: Optional[int], poll_value: Optional[int]) -> bytes:
         """
         Helper function to build the datagrams to be sent to the Scaffold
         device. Also performs basic check on arguments.
+
         :rw: 1 for a write command, 0 for a read command.
         :addr: Register address.
         :size: Size of the data to be sent or received. Maximum size is 255.
@@ -1977,6 +2073,81 @@ class ScaffoldBus:
             datagram.append(size)
         return datagram
 
+    def fetch_oldest_operation_result(self):
+        op = self.__operations[0]
+        if op.kind == BusOperationKind.WRITE:
+            ack = self.ser.read(1)[0]
+            op.resolve(ack)
+            # Remove operation from the queue.
+            # If operation has not been copied, this will trigger checks and
+            # raise TimeoutError if the operation timed out.
+        else:
+            ack = self.ser.read(op.size + 1)
+            data = ack[:ack[-1]]  # Last byte of ACK is size of read data
+            op.resolve(data)
+        del self.__operations[0]
+
+    def __require_fifo_space(self, size: int):
+        """
+        Wait for pending operations to complete until there is `size` bytes
+        available in the FIFO.
+        """
+        while self.FIFO_MAX_SIZE - self.__fifo_size() < size:
+            assert len(self.__operations) > 0
+            self.fetch_oldest_operation_result()
+
+    def operation_write(
+            self, addr: int, data: bytes, poll: Optional[int] = None,
+            poll_mask: int = 0xff, poll_value: int = 0x00) -> BusOperation:
+        """
+        Write data to a register.
+
+        :param addr: Register address.
+        :param data: Data to be written.
+        :param poll: Register instance or address, if polling is required.
+        :param poll_mask: Register polling mask.
+        :param poll_value: Register polling value.
+        :return: Write pending operation.
+        """
+        if self.ser is None:
+            raise RuntimeError('Not connected to board')
+
+        assert len(data) <= self.MAX_CHUNK
+        datagram = self.prepare_datagram(
+            1, addr, len(data), poll, poll_mask, poll_value)
+        datagram += data
+        assert len(datagram) < self.FIFO_MAX_SIZE
+        self.__require_fifo_space(len(datagram))
+        op = BusOperation(
+            self, BusOperationKind.WRITE, len(data), len(datagram))
+        self.__operations.append(op)
+        self.ser.write(datagram)
+        return op
+
+    def operation_read(
+            self, addr: int, size: int = 1, poll: Optional[int] = None,
+            poll_mask: int = 0xff, poll_value: int = 0x00) -> BusOperation:
+        """
+        Read data from a register.
+
+        :param addr: Register address.
+        :param poll: Register instance or address, if polling is required.
+        :param poll_mask: Register polling mask.
+        :param poll_value: Register polling value.
+        :return: Read pending operation.
+        """
+        if self.ser is None:
+            raise RuntimeError('Not connected to board')
+
+        assert size <= self.MAX_CHUNK
+        datagram = self.prepare_datagram(
+            0, addr, size, poll, poll_mask, poll_value)
+        self.__require_fifo_space(len(datagram))
+        op = BusOperation(self, BusOperationKind.READ, size, len(datagram))
+        self.__operations.append(op)
+        self.ser.write(datagram)
+        return op
+
     def write(
             self, addr, data, poll=None, poll_mask=0xff, poll_value=0x00):
         """
@@ -1988,9 +2159,6 @@ class ScaffoldBus:
         :param poll_mask: Register polling mask.
         :param poll_value: Register polling value.
         """
-        if self.ser is None:
-            raise RuntimeError('Not connected to board')
-
         # If data is an int, convert it to bytes.
         if type(data) is int:
             data = bytes([data])
@@ -1999,44 +2167,11 @@ class ScaffoldBus:
         remaining = len(data)
         while remaining:
             chunk_size = min(self.MAX_CHUNK, remaining)
-            datagram = self.prepare_datagram(
-                1, addr, chunk_size, poll, poll_mask, poll_value)
-            datagram += data[offset:offset + chunk_size]
-            assert len(datagram) < self.FIFO_SIZE
+            op = self.operation_write(
+                addr, data[offset:offset + chunk_size], poll, poll_mask,
+                poll_value)
             if self.__lazy_stack == 0:
-                self.ser.write(datagram)
-                # Check immediately the result of the write operation.
-                ack = self.ser.read(1)[0]
-                if ack != chunk_size:
-                    assert poll is not None
-                    # Timeout error !
-                    raise TimeoutError(
-                        size=offset+ack, expected=offset+chunk_size)
-            else:
-                # Lazy-update section. The write result will be checked later,
-                # when all lazy-sections are closed.
-                dg_len = len(datagram)
-                # We don't know how many write datagram have been processed
-                # until we don't fetch the responses. It is possible to
-                # overflow the hardware FIFO if a polling operation is
-                # blocking. We have to check for those potential troubles.
-                while self.__lazy_fifo_total_size + dg_len > self.FIFO_SIZE:
-                    # FIFO might be full. We must process some responses to get
-                    # some guaranteed FIFO space
-                    expected_size = self.__lazy_writes[0]
-                    # Following read will block if first operation in the FIFO
-                    # is still pending.
-                    ack = self.ser.read(1)[0]
-                    del self.__lazy_writes[0]
-                    self.__lazy_fifo_total_size -= self.__lazy_fifo_sizes[0]
-                    del self.__lazy_fifo_sizes[0]
-                    if ack != expected_size:
-                        # Timeout error !
-                        raise TimeoutError(size=ack, expected=expected_size)
-                self.__lazy_fifo_total_size += dg_len
-                self.__lazy_fifo_sizes.append(dg_len)
-                self.ser.write(datagram)
-                self.__lazy_writes.append(chunk_size)
+                _ = op.result
             remaining -= chunk_size
             offset += chunk_size
 
@@ -2052,8 +2187,6 @@ class ScaffoldBus:
         :param poll_value: Register polling value.
         :return: bytearray
         """
-        if self.ser is None:
-            raise RuntimeError('Not connected to board')
         # Read operation not permitted during lazy-update sections
         if self.__lazy_stack > 0:
             raise RuntimeError(
@@ -2063,16 +2196,9 @@ class ScaffoldBus:
         offset = 0
         while remaining:
             chunk_size = min(self.MAX_CHUNK, remaining)
-            datagram = self.prepare_datagram(
-                0, addr, chunk_size, poll, poll_mask, poll_value)
-            self.ser.write(datagram)
-            res = self.ser.read(chunk_size+1)
-            ack = res[-1]
-            if ack != chunk_size:
-                assert poll is not None
-                result += res[:ack]
-                raise TimeoutError(data=result, expected=chunk_size+offset)
-            result += res[:-1]
+            op = self.operation_read(
+                addr, chunk_size, poll, poll_mask, poll_value)
+            result += op.result
             remaining -= chunk_size
             offset += chunk_size
         return result
@@ -2091,6 +2217,13 @@ class ScaffoldBus:
         datagram += value.to_bytes(4, 'big', signed=False)
         self.ser.write(datagram)
         # No response expected from the board
+
+    def __fifo_size(self) -> int:
+        """
+        :return: Maximum possible current FIFO size, based on on-going
+            operations.
+        """
+        return sum(op.fifo_size for op in self.__operations)
 
     @property
     def is_connected(self):
