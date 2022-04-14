@@ -2026,6 +2026,7 @@ class ScaffoldBus:
         # Timeout stack for push_timeout and pop_timeout methods.
         self.__timeout_stack = []
         self.__operations: List[BusOperation] = []
+        self.__fifo_size = 0
 
     def connect(self, dev):
         """
@@ -2091,14 +2092,17 @@ class ScaffoldBus:
             ack = self.ser.read(op.size + 1)
             data = ack[:ack[-1]]  # Last byte of ACK is size of read data
             op.resolve(data)
+        self.__fifo_size -= op.fifo_size
         del self.__operations[0]
+        if len(self.__operations) == 0:
+            assert self.__fifo_size == 0
 
     def __require_fifo_space(self, size: int):
         """
         Wait for pending operations to complete until there is `size` bytes
         available in the FIFO.
         """
-        while self.FIFO_MAX_SIZE - self.__fifo_size() < size:
+        while self.FIFO_MAX_SIZE - self.__fifo_size < size:
             assert len(self.__operations) > 0
             self.fetch_oldest_operation_result()
 
@@ -2138,6 +2142,7 @@ class ScaffoldBus:
             op = BusOperation(self, kind, data, len(datagram))
         self.__require_fifo_space(len(datagram))
         self.__operations.append(op)
+        self.__fifo_size += len(datagram)
         self.ser.write(datagram)
         return op
 
@@ -2211,13 +2216,6 @@ class ScaffoldBus:
         datagram += value.to_bytes(4, 'big', signed=False)
         self.ser.write(datagram)
         # No response expected from the board
-
-    def __fifo_size(self) -> int:
-        """
-        :return: Maximum possible current FIFO size, based on on-going
-            operations.
-        """
-        return sum(op.fifo_size for op in self.__operations)
 
     @property
     def is_connected(self):
