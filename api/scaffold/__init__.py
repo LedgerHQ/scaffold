@@ -2027,6 +2027,7 @@ class ScaffoldBus:
         self.__timeout_stack = []
         self.__operations: List[BusOperation] = []
         self.__fifo_size = 0
+        self.__in_buffer = bytearray()
 
     def connect(self, dev):
         """
@@ -2080,16 +2081,30 @@ class ScaffoldBus:
             datagram.append(size)
         return datagram
 
+    def __ser_read(self, n: int) -> bytes:
+        """
+        Read from serial device, with caching to slightly improve performances.
+
+        :param n: Number of bytes to read.
+        :return: Bytes read.
+        """
+        if n > len(self.__in_buffer):
+            avail = self.ser.in_waiting
+            self.__in_buffer += self.ser.read(max(n, avail))
+        result = self.__in_buffer[:n]
+        self.__in_buffer = self.__in_buffer[n:]
+        return result
+
     def fetch_oldest_operation_result(self):
         op = self.__operations[0]
         if op.kind == BusOperationKind.WRITE:
-            ack = self.ser.read(1)[0]
+            ack = self.__ser_read(1)[0]
             op.resolve(ack)
             # Remove operation from the queue.
             # If operation has not been copied, this will trigger checks and
             # raise TimeoutError if the operation timed out.
         else:
-            ack = self.ser.read(op.size + 1)
+            ack = self.__ser_read(op.size + 1)
             data = ack[:ack[-1]]  # Last byte of ACK is size of read data
             op.resolve(data)
         self.__fifo_size -= op.fifo_size
@@ -2243,20 +2258,6 @@ class ScaffoldBus:
             raise RuntimeError('No lazy section started')
         self.__lazy_stack -= 1
         last_error = None
-        if self.__lazy_stack == 0:
-            # We closes all update blocks, we must now check all responses of
-            # write requests.
-            for expected_size in self.__lazy_writes:
-                ack = self.ser.read(1)[0]
-                if ack != expected_size:
-                    # Timeout error !
-                    last_error = TimeoutError(size=ack, expected=expected_size)
-            self.__lazy_writes.clear()
-            # All writes have been processed, we know the FIFO buffer is empty.
-            self.__lazy_fifo_total_size = 0
-            self.__lazy_fifo_sizes.clear()
-            if last_error is not None:
-                raise last_error
 
     @property
     def timeout(self) -> Optional[float]:
